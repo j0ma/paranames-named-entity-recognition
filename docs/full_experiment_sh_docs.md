@@ -1,7 +1,8 @@
+# `full_experiment.sh`
 
 ### Related scripts
-- [`code/bilstm_crf_softgazetteers.py`](code/bilstm_crf_softgazetteers.py)
-- [`code/create_softgaz_features.py`](code/create_softgaz_features.py)
+- [`code/bilstm_crf_softgazetteers.py`](../code/bilstm_crf_softgazetteers.py)
+- [`code/create_softgaz_features.py`](../code/create_softgaz_features.py)
 
 ### What it does
 
