@@ -1,7 +1,7 @@
 # ParaNames - NER experiments
 
 ### Documentation
-- [[full_experiment_sh_docs|full_recipes.sh]]
+- [`full_experiment.sh`](./docs/full_experiment_sh_docs.md)
 
 ### How to run things?
 
