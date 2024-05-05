@@ -53,7 +53,7 @@ The different commands to run are
 - `check_env`: checks that the environment has everything we need
 - `create_experiment`: uses `prepx` to create a dedicated folder for the experiment
 - `preprocess`: runs any preprocessing logic
-- `train`: runs the actual LSTM-CFF training logic
+- `train`: runs the actual LSTM-CRF training logic
 - `evaluate`: runs `seqscore` for evaluation
 
 #### `check_deps`
