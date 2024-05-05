@@ -1,281 +1,559 @@
-"""
-Creates soft gazetteer features for an input file in conll format given a list of entity linking candidates for ngrams up to length 3.
+""" CNN-BiLSTM-CRF model (Ma and Hovy, 2016) with soft gazetteer features and an autoencoder reconstruction loss (Wu et al., 2018) 
+Authors:
+* Original author: Shruti Rijhwani
+* This version: Jonne Saleva
 
-Author: Shruti Rijhwani
-Contact: srijhwan@andrew.cmu.edu
+Contact: jonnesaleva@brandeis.edu
 
-Please cite: 
+Please cite (original paper): 
 Soft Gazetteers for Low-Resource Named Entity Recognition (ACL 2020)
 https://www.aclweb.org/anthology/2020.acl-main.722
 """
 
-from collections import Counter
-from pathlib import Path
+from __future__ import print_function
+
 import argparse
+import glob
+import logging
+import os
+import random
+import re
+import sys
+import time
+from collections import defaultdict
+from subprocess import PIPE, Popen
+
+import _dynet as dy
 import numpy as np
-import epitran
 from tqdm import tqdm
-from rich import print as pprint
 
-ALL = ["all"]
+from args import return_argparser
+from cnn import CNNModule
+from crf import CRFModule
+
+UNK = "$unk"
+DATA = ""
+DROPOUT = 0.5
+NUM_TYPES = 3
+CNN_OUT_SIZE = 30
+FEAT_OUT_SIZE = 128
+DIGIT_RE = re.compile(r"\d")
 
 
-class SoftGazFeatureCreator(object):
+class NERTagger(object):
     def __init__(
-        self, kb_file, feat_types, candidate_file, epilang, normalize, ner_types
+        self,
+        embed_size,
+        word_hidden_size,
+        training_file,
+        dev_file,
+        test_file,
+        batch_size,
+        model_file,
+        lstm_feats,
+        crf_feats,
+        autoencoder,
+        train_features,
+        dev_features,
+        test_features,
+        testing,
+        restart,
+        feat_func,
     ):
-        if feat_types == ALL:
-            self.feats = ["top1", "top30", "top3", "margin"]
-        else:
-            self.feats = feat_types
+        self.crf_feats = crf_feats
+        self.lstm_feats = lstm_feats
+        self.autoencoder = autoencoder
+        self.embed_size = embed_size
+        self.word_hidden_size = word_hidden_size
+        self.model_file = model_file
 
-        if epilang:
-            self.epi = epitran.Epitran(epilang)
-        else:
-            self.epi = None
+        self.featsize = 0
 
-        self.normalize = normalize
+        self.word_vocab = defaultdict(lambda: len(self.word_vocab))
+        self.char_vocab = defaultdict(lambda: len(self.char_vocab))
+        self.tag_vocab = defaultdict(lambda: len(self.tag_vocab))
+        self.word_lookup = []
 
-        type_codes = {ner_type: type_ix for type_ix, ner_type in enumerate(ner_types)}
-        if "LOC" in type_codes:
-            type_codes["GPE"] = type_codes["LOC"]
+        self.training_data = self.read_train(training_file, train_features)
+        self.dev_data = self.read_test(dev_file, dev_features)
+        self.test_data = self.read_test(test_file, test_features)
+        self.batch_size = batch_size
+        self.reverse_tag_lookup = dict((v, k) for k, v in self.tag_vocab.items())
+        self.reverse_word_lookup = dict((v, k) for k, v in self.word_vocab.items())
 
-        pprint("Here are the types:")
-        pprint(type_codes)
+        self.model = dy.ParameterCollection()
 
-        self.num_types = len(type_codes)
+        self.cnn = CNNModule(self.model, self.char_vocab)
+        self.word_embeds = self.model.add_lookup_parameters(
+            (len(self.word_vocab), embed_size)
+        )
+        arr = np.array(self.word_lookup)
+        self.word_embeds.init_from_array(arr)
+        self.word_lstm = dy.BiRNNBuilder(
+            1,
+            CNN_OUT_SIZE + embed_size + FEAT_OUT_SIZE,
+            word_hidden_size,
+            self.model,
+            dy.LSTMBuilder,
+        )
 
-        self.type_lookup = self.load_kb(kb_file, type_codes)
-        self.ngram_candidates = self.load_candidates(candidate_file)
+        self.feat_w = self.model.add_parameters((FEAT_OUT_SIZE, self.featsize))
+        self.feat_b = self.model.add_parameters((FEAT_OUT_SIZE))
+        self.feat_func = feat_func
 
-    def load_kb(self, kb_file, type_codes):
-        type_lookup = {}
-        with open(kb_file, "r", encoding="utf8") as f:
-            for line in f:
-                # spl = [wiki_id, names/aliases, ner_type]
-                spl = line.strip().split(" ||| ")
-                if spl[2] != "null":
-                    # spl[0] = wiki_id; spl[2] = ner_type
-                    type_lookup[spl[0]] = type_codes[spl[2]]
-        return type_lookup
+        num_tags = len(self.tag_vocab) + 2
+        self.num_tags = num_tags
 
-    def load_candidates(self, candidate_file):
-        ngram_candidates = {}
-        with open(candidate_file, "r", encoding="utf8") as f:
-            for line in f:
-                # spl = [span_string, wiki_id, ...]
-                spl = line.strip().split(" ||| ")
-                if len(spl) < 2:
-                    continue
-                ngram_candidates[spl[0]] = spl[1]
+        # Last linear layer to map the output of the LSTM to the tag space
+        self.context_to_emit_w = self.model.add_parameters(
+            (len(self.tag_vocab), word_hidden_size + FEAT_OUT_SIZE)
+        )
+        self.context_to_emit_b = self.model.add_parameters((len(self.tag_vocab)))
+        self.crf_module = CRFModule(self.model, self.tag_vocab)
 
-        return ngram_candidates
+        self.o_tag = self.tag_vocab["O"]
 
-    def get_ngram_contexts(self, idx, sent, n):
-        contexts = [0] * n
-        for k in range(n):
-            lower = idx + 1 - n + k
-            upper = idx + 1 + k
-            ngram_ctx_tokens = sent[lower:upper]
-            ngram_ctx_string = " ".join(ngram_ctx_tokens)
-            contexts[k] = ngram_ctx_string
-        return contexts
+        self.context_to_trans_w = self.model.add_parameters(
+            (num_tags * num_tags, word_hidden_size + FEAT_OUT_SIZE)
+        )
+        self.context_to_trans_b = self.model.add_parameters((num_tags * num_tags))
 
-    def create_features(self, conll_file):
-        sents = []
-        cur_sent = []
+        self.feat_reconstruct_w = self.model.add_parameters(
+            (self.featsize, word_hidden_size)
+        )
+        self.feat_reconstruct_b = self.model.add_parameters((self.featsize))
 
-        # Read in the text from the input conll file into a list of sentences
-        with open(conll_file, "r", encoding="utf8") as f:
-            for line in f:
-                if line == "\n":
-                    sents.append(cur_sent)
-                    cur_sent = []
-                    continue
+        if DROPOUT > 0.0:
+            self.word_lstm.set_dropout(DROPOUT)
+
+        if os.path.exists(self.model_file) and (testing or restart):
+            self.model.populate(self.model_file)
+            print("Populated!")
+            v_acc = self.compute_f1_conlleval(self.dev_data, print_out="dev.")
+            print("Validation F1: %f\n" % v_acc)
+
+    def save_model(self):
+        self.model.save(self.model_file)
+
+    # Read the training data and builds the tag/word vocabulary
+    def read_train(self, filename, feature_file):
+        train_sents = []
+
+        feature_vectors = np.load(feature_file, allow_pickle=True)["feats"]
+
+        if self.featsize == 0:
+            self.featsize = int(feature_vectors[0][0].shape[0])
+        sent_count = 0
+        with open(filename, "r", encoding="utf8") as fh:
+            sent = []
+
+            for line in fh:
                 spl = line.strip().split()
-                cur_sent.append(spl[0])
-            sents.append(cur_sent)
 
-        inputfile_feats = []
-
-        # Compute features for each sentence based on spans up to length 3
-        already_printed_matches = set()
-        for sent in tqdm(sents, desc="Constructing sentence features..."):
-            sent_feats = []
-            for i, word in enumerate(sent):
-                feats = []
-                for n in range(1, 4):
-
-                    # Feature vectors for span length n for the current word
-                    top1_scores = np.zeros(shape=(2, self.num_types))
-                    top3_counts = np.zeros(shape=(3, self.num_types))
-                    top3_scores = np.zeros(shape=(3, self.num_types))
-                    top30_counts = np.zeros(shape=(self.num_types,))
-                    margins = np.zeros(shape=(3,))
-
-                    # Get all spans of length n that contain the current word
-                    contexts = self.get_ngram_contexts(i, sent, n)
-
-                    # Compute features for each context
-                    for j, context_g in enumerate(contexts):
-
-                        # Convert context to IPA if the candidates are in IPA
-                        if self.epi:
-                            context = self.epi.transliterate(context_g)
-                        else:
-                            context = context_g
-
-                        if (
-                            context not in self.ngram_candidates
-                            or not context
-                            or len(context.split()) != n
-                        ):
-                            continue
-                        elif context not in already_printed_matches:
-                            pprint(
-                                f"Match found: {context} -> {self.ngram_candidates[context]}"
-                            )
-                            already_printed_matches.add(context)
-
-                        # Get candidates for the current context
-                        def safe_unpack(cand_str, default_weight=1.0):
-                            """Safely unpack a candidate tuple with a default weight."""
-                            tokens = cand_str.split(" | ")
-                            try:
-                                candidate, weight = tokens
-                                weight = float(weight)
-                            except ValueError:
-                                candidate, weight = tokens[0], default_weight
-
-                            return candidate, weight
-
-                        candidates = self.ngram_candidates[context].split(" || ")
-                        cands = [safe_unpack(cand) for cand in candidates]
-
-                        if "top1" in self.feats:
-                            top1 = cands[0]
-                            if top1[0] in self.type_lookup:
-                                if j == len(contexts) - 1:
-                                    top1_scores[0][self.type_lookup[top1[0]]] += float(
-                                        top1[1]
-                                    )
-                                else:
-                                    top1_scores[1][self.type_lookup[top1[0]]] += float(
-                                        top1[1]
-                                    )
-
-                        if len(cands) < 3:
-                            continue
-
-                        if "top3" in self.feats:
-                            for k in range(3):
-                                cand = cands[k]
-                                top3_counts[k][self.type_lookup[cand[0]]] += 1
-                                top3_scores[k][self.type_lookup[cand[0]]] += float(
-                                    cand[1]
-                                )
-
-                        if "top30" in self.feats:
-                            for cand in cands[:30]:
-                                top30_counts[self.type_lookup[cand[0]]] += 1
-
-                        if len(cands) < 4:
-                            continue
-
-                        if "margin" in self.feats:
-                            for k in range(3):
-                                margins[k] += float(cands[k][1]) - float(
-                                    cands[k + 1][1]
-                                )
-
-                    # Normalize vectors after adding scores from all spans of length n
-                    if self.normalize:
-                        top1_scores = top1_scores / len(contexts)
-                        for k in range(3):
-                            top3_counts[k] = top3_counts[k] / len(contexts)
-                            top3_scores[k] = top3_scores[k] / len(contexts)
-                        top30_counts = top30_counts / (30 * len(contexts))
-                        margins = margins / len(contexts)
-
-                    # Concatenate all feature vectors for the current span length
-                    feats.append(
-                        np.hstack(
-                            (
-                                top1_scores.reshape(
-                                    2 * self.num_types,
-                                ),
-                                top3_counts.reshape(
-                                    3 * self.num_types,
-                                ),
-                                top3_scores.reshape(
-                                    3 * self.num_types,
-                                ),
-                                top30_counts,
-                                margins,
-                            )
+                if line == "\n":
+                    cur_feats = feature_vectors[sent_count]
+                    sent = [
+                        (
+                            [self.char_vocab[c] for c in word],
+                            self.word_to_int(word),
+                            feats,
+                            self.tag_vocab[tag],
                         )
+
+                        for (word, tag), feats in zip(sent, cur_feats)
+                    ]
+                    train_sents.append(sent)
+                    sent_count += 1
+                    sent = []
+
+                    continue
+                sent.append((spl[0], spl[-1]))
+
+        # NOTE: in CoNLL format, the last line needs to be empty.
+        # However, currently the code assumes this to not be the case.
+        # We can check for this and appropriately decrement sent_count
+        # if we've exited the file scan but our last sent was empty.
+
+        if spl:
+            print(f"Non-empty last line: {spl}!")
+            print(f"👷 Constructing features for last sentence...")
+            cur_feats = feature_vectors[sent_count]
+            sent = [
+                (
+                    [self.char_vocab[c] for c in word],
+                    self.word_to_int(word),
+                    feats,
+                    self.tag_vocab[tag],
+                )
+
+                for (word, tag), feats in zip(sent, cur_feats)
+            ]
+            train_sents.append(sent)
+        else:
+            print(f"Empty last line detected: {spl}")
+            print(f"Decrementing total sentence count by 1")
+            sent_count -= 1
+
+        print(f"❗ No. of sents seen in train: {len(train_sents)}")
+        print(f"❗ No. of unique tags seen in train: {len(self.tag_vocab)}")
+
+        return train_sents
+
+    # Read the validation and test sets
+    def read_test(self, filename, feature_file):
+        sents = []
+
+        feature_vectors = np.load(feature_file, allow_pickle=True)["feats"]
+        sent_count = 0
+        with open(filename, "r", encoding="utf8") as f:
+            sent = []
+
+            for line in f:
+                spl = line.strip().split()
+
+                if line == "\n":
+                    cur_feats = feature_vectors[sent_count]
+                    sent = [
+                        (
+                            [self.char_to_int(c) for c in word],
+                            self.word_to_int(word),
+                            feats,
+                            self.tag_vocab[tag],
+                        )
+
+                        for (word, tag), feats in zip(sent, cur_feats)
+                    ]
+                    sents.append(sent)
+                    sent = []
+                    sent_count += 1
+
+                    continue
+                sent.append((spl[0], spl[-1]))
+        cur_feats = feature_vectors[sent_count]
+        sent = [
+            (
+                [self.char_to_int(c) for c in word],
+                self.word_to_int(word),
+                feats,
+                self.tag_vocab[tag],
+            )
+
+            for (word, tag), feats in zip(sent, cur_feats)
+        ]
+        sents.append(sent)
+
+        return sents
+
+    # Get char ID
+    def char_to_int(self, char):
+        if char in self.char_vocab:
+            return self.char_vocab[char]
+        else:
+            return self.char_vocab[UNK]
+
+    def word_to_int(self, word):
+        word = DIGIT_RE.sub("0", word)
+
+        if word in self.word_vocab:
+            return self.word_vocab[word]
+        else:
+            vec = np.random.uniform(
+                low=-np.sqrt(3.0 / self.embed_size),
+                high=np.sqrt(3.0 / self.embed_size),
+                size=(self.embed_size,),
+            )
+            self.word_lookup.append(vec.tolist())
+
+            return self.word_vocab[word]
+
+    # Get tag ID
+    def lookup_tag(self, tag_id):
+        return self.reverse_tag_lookup[tag_id]
+
+    def lookup_word(self, word_id):
+        return self.reverse_word_lookup[word_id]
+
+    # Get LSTM features in tag space for CRF decoding
+
+    def get_features_for_tagging(self, sentence, training):
+        word_feats = [
+            dy.affine_transform(
+                [
+                    self.feat_b,
+                    self.feat_w,
+                    dy.inputTensor(feats.reshape(self.featsize, 1)),
+                ]
+            )
+
+            for chars, word, feats, tag in sentence
+        ]
+        zero_feats = [
+            dy.inputTensor(np.zeros(shape=(FEAT_OUT_SIZE, 1)))
+
+            for chars, word, feats, tag in sentence
+        ]
+
+        # Non-linear transform for soft gazetteer features
+
+        if self.feat_func == "tanh":
+            word_feats = [dy.tanh(feat) for feat in word_feats]
+        elif self.feat_func == "relu":
+            word_feats = [dy.rectify(feat) for feat in word_feats]
+
+        # Soft gazetteer features at the LSTM level
+
+        if self.lstm_feats:
+            cur_feats = word_feats
+        else:
+            cur_feats = zero_feats
+        word_reps = [
+            dy.concatenate(
+                [self.cnn.encode(chars, training), self.word_embeds[word], enc_feat]
+            )
+
+            for enc_feat, (chars, word, feats, tag) in zip(cur_feats, sentence)
+        ]
+
+        contexts = self.word_lstm.transduce(word_reps)
+
+        # Soft gazetteer features at the CRF level
+
+        if self.crf_feats:
+            cur_feats = word_feats
+        else:
+            cur_feats = zero_feats
+
+        features = [
+            dy.affine_transform(
+                [
+                    self.context_to_emit_b,
+                    self.context_to_emit_w,
+                    dy.concatenate([context, feats]),
+                ]
+            )
+
+            for context, feats in zip(contexts, cur_feats)
+        ]
+        t_features = [
+            dy.reshape(
+                dy.affine_transform(
+                    [
+                        self.context_to_trans_b,
+                        self.context_to_trans_w,
+                        dy.concatenate([context, feats]),
+                    ]
+                ),
+                (self.num_tags, self.num_tags),
+            )
+
+            for context, feats in zip(contexts, cur_feats)
+        ]
+
+        # Autoencoder feature reconstruction
+
+        if self.lstm_feats:
+            feat_reconstruct = [
+                dy.logistic(
+                    dy.affine_transform(
+                        [self.feat_reconstruct_b, self.feat_reconstruct_w, context]
                     )
+                )
 
-                # Concatenate vectors from all span lengths for the current word
-                feats = np.hstack(tuple(feats))
-                sent_feats.append(feats)
+                for context in contexts
+            ]
+        else:
+            feat_reconstruct = [
+                dy.inputTensor(np.zeros(shape=(self.featsize,))) for context in contexts
+            ]
 
-            # Append current sentence's features to the list of features for the input conll file
-            inputfile_feats.append(np.array(sent_feats))
+        return features, t_features, feat_reconstruct
 
-        # Return sentence-wise list of features
-        return inputfile_feats
+    # Forward pass - BiLSTM + CRF, returns predicted tags obtained from viterbi decoding per sentence
+
+    def get_output(self, sents):
+        dy.renew_cg()
+        tagged_sents = []
+
+        for ix, sent in enumerate(sents):
+            if not sent:
+                continue
+            features, t_feats, _ = self.get_features_for_tagging(sent, False)
+            cur_tag_seq, _ = self.crf_module.viterbi_decoding(features, t_feats)
+            tagged_sents.append(cur_tag_seq)
+
+        return tagged_sents
+
+    # Calculate the loss - neg log likelihood from crf
+    def calculate_loss(self, sents):
+        dy.renew_cg()
+        losses = []
+
+        for sent in sents:
+            features, t_features, feat_reconstruct = self.get_features_for_tagging(
+                sent, True
+            )
+            gold_tags = [tag for chars, word, feats, tag in sent]
+            cur_loss = self.crf_module.negative_log_loss(
+                features, t_features, gold_tags
+            )
+
+            if self.autoencoder:
+                autoencoder_loss = [
+                    dy.binary_log_loss(reconstruct, dy.inputTensor(feats))
+
+                    for reconstruct, (chars, word, feats, tag) in zip(
+                        feat_reconstruct, sent
+                    )
+                ]
+            else:  # remove autoencoder loss
+                autoencoder_loss = [dy.scalarInput(0)]
+            losses.append(cur_loss + (dy.esum(autoencoder_loss) / self.featsize))
+
+        return dy.esum(losses)
+
+    def train(self, epochs, trainer, lr, no_decay, patience, end_patience):
+        if trainer == "sgd":
+            trainer = dy.MomentumSGDTrainer(self.model, learning_rate=lr)
+            trainer.set_clip_threshold(5.0)
+        else:
+            trainer = dy.AdamTrainer(self.model)
+        best_acc = 0
+
+        print(len(self.training_data))
+
+        check_val = int(len(self.training_data) / (5.0 * self.batch_size))
+        best_ep = -1
+
+        for ep in range(epochs):
+            logging.info("Epoch: %d" % ep)
+            ep_loss = 0
+            num_batches = 0
+            random.shuffle(self.training_data)
+
+            for i in range(0, len(self.training_data), self.batch_size):
+                if num_batches % check_val == 0:
+                    v_acc = self.compute_f1_conlleval(
+                        self.dev_data, print_out="dev.temp."
+                    )
+                    logging.info("Validation F1: %f" % v_acc)
+
+                    if v_acc > best_acc:
+                        self.save_model()
+                        best_acc = v_acc
+                        logging.info("Saved!")
+                        best_ep = ep
+                cur_size = min(self.batch_size, len(self.training_data) - i)
+                loss = self.calculate_loss(self.training_data[i : i + cur_size])
+                ep_loss += loss.scalar_value()
+                loss.backward()
+                trainer.update()
+                num_batches += 1
+            logging.info("Training loss: %f" % ep_loss)
+
+            if (ep - best_ep) > end_patience:
+                self.model.populate(self.model_file)
+                logging.info("Training patience reached.\n")
+
+                break
+
+            if not no_decay and (ep - best_ep) > patience:
+                self.model.populate(self.model_file)
+                # best_ep = ep
+                lr = trainer.learning_rate / 1.05
+                trainer.learning_rate = lr
+                logging.info("New learning rate: " + str(lr))
+            logging.info("\n")
+
+    def compute_f1_conlleval(self, sents, print_out="temp."):
+        if DROPOUT > 0.0:
+            self.word_lstm.set_dropout(0)
+        outputs = []
+
+        for i in range(0, len(sents), self.batch_size):
+            cur_size = min(self.batch_size, len(sents) - i)
+            outputs += self.get_output(sents[i : i + cur_size])
+
+        if DROPOUT > 0.0:
+            self.word_lstm.set_dropout(DROPOUT)
+
+        outfile = f"{OUTPUT_FOLDER}/{print_out}{output_name}"
+        with open(outfile, "w", encoding="utf8") as out:
+            for sent, output in zip(sents, outputs):
+                for (_, word, _, tag), pred_tag in zip(sent, output):
+                    out.write(
+                        self.lookup_word(word)
+                        + " "
+                        + self.lookup_tag(tag).upper()
+                        + " "
+                        + self.lookup_tag(pred_tag).upper()
+                        + "\n"
+                    )
+                out.write("\n")
+            out.write("\n")
+
+        cmd = "cat " + outfile + " | " + "./conlleval_f1"
+        process = Popen(cmd, stdout=PIPE, stdin=PIPE, shell=True)
+        f1 = float(process.communicate()[0].strip())
+
+        return f1
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--candidates",
-        help="candidate file from exact match, WikiMention, PBEL or other candidate generation methods",
-    )
-    parser.add_argument("--kb", help="knowledge base file")
-    parser.add_argument(
-        "--normalize",
-        action="store_true",
-        help="boolean value for creating the features normalized or unnormalized (normalize recommended)",
-    )
-    parser.add_argument(
-        "--feats",
-        nargs="+",
-        default=ALL,
-        help="feature types: top1, top30, top3, margin",
-    )
-    parser.add_argument("--conll_file", help="conll file to process into features")
-    parser.add_argument(
-        "--epilang",
-        default=None,
-        help="If candidates are in IPA (e.g., from PBEL), convert input conll text to IPA using epitran",
-    )
-    parser.add_argument("--output_folder", help="output folder name")
-    parser.add_argument(
-        "--ner_types", help="comma-separated list of NER types.", default="LOC,PER,ORG"
-    )
-    args = parser.parse_args()
+    parser = return_argparser()
+    args, unknown = parser.parse_known_args()
 
-    parsed_ner_types = args.ner_types.split(",")
+    output_name = args.output_name
+    OUTPUT_FOLDER = args.output_folder
+    MODELS_FOLDER = args.models_folder
+    EPOCHS = int(args.num_epochs)
 
-    feature_creator = SoftGazFeatureCreator(
-        kb_file=args.kb,
-        feat_types=args.feats,
-        candidate_file=args.candidates,
-        epilang=args.epilang,
-        normalize=args.normalize,
-        ner_types=parsed_ner_types,
+    tagger_model = NERTagger(
+        embed_size=args.embed,
+        word_hidden_size=args.word_hidden_size,
+        training_file=args.train,
+        dev_file=args.dev,
+        test_file=args.test,
+        batch_size=args.batch_size,
+        train_features=args.train_feats,
+        dev_features=args.dev_feats,
+        test_features=args.test_feats,
+        model_file=f"{MODELS_FOLDER}/{output_name}",
+        lstm_feats=args.lstm_feats,
+        crf_feats=args.crf_feats,
+        autoencoder=args.autoencoder,
+        testing=args.testing,
+        restart=args.restart,
+        feat_func=args.feat_func,
     )
 
-    inputfile_feats = feature_creator.create_features(conll_file=args.conll_file)
-    are_all_feats_zero = all(s == 0.0 for s in [arr.sum() for arr in inputfile_feats])
-    pprint(f"All features 0? {are_all_feats_zero}")
-    pprint(Counter(a.sum() for a in inputfile_feats))
-    conll_path = Path(args.conll_file)
-    output_name = f"{conll_path.name}.softgazfeats"
-    output_fname = Path(args.output_folder) / output_name
+    if int(args.testing):
+        test_acc = tagger_model.compute_f1_conlleval(
+            tagger_model.test_data, print_out="test."
+        )
+        print("Test F1: %f\n" % test_acc)
+    else:  # OUTPUT_FOLDER + output_name + ".log",
+        logging.basicConfig(
+            filename="/dev/stdout",
+            level=logging.INFO,
+            format="%(message)s",
+            filemode="w",
+        )
+        logging.info(str(args) + "\n")
 
-    # Save sentence-wise list of features as compressed numpy array; number of rows = number of sentences in the input file
-    # Each row is a list of feature vectors (one for each word). The size of the list is the number of words in the sentence.
-    np.savez_compressed(str(output_fname), feats=np.array(inputfile_feats))
+        start = time.time()
+        tagger_model.train(
+            epochs=EPOCHS,
+            trainer=args.trainer,
+            lr=args.lr,
+            no_decay=args.no_decay,
+            patience=5,
+            end_patience=30,
+        )
+        end = time.time()
+        logging.info("Training time: %0.4f\n" % (end - start))
+
+        if args.test:
+            test_acc = tagger_model.compute_f1_conlleval(
+                tagger_model.test_data, print_out="test."
+            )
+            logging.info("Test F1: %f\n" % test_acc)

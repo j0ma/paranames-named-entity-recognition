@@ -1,21 +1,24 @@
 """
 Creates soft gazetteer features for an input file in conll format given a list of entity linking candidates for ngrams up to length 3.
 
-Author: Shruti Rijhwani
-Contact: srijhwan@andrew.cmu.edu
+Authors: 
+    * Original author: Shruti Rijhwani
+    * This version/fork: Jonne Sälevä
+Contact: jonnesaleva@brandeis.edu
 
-Please cite: 
+Please cite (original paper): 
 Soft Gazetteers for Low-Resource Named Entity Recognition (ACL 2020)
 https://www.aclweb.org/anthology/2020.acl-main.722
 """
 
+import argparse
 from collections import Counter
 from pathlib import Path
-import argparse
-import numpy as np
+
 import epitran
-from tqdm import tqdm
+import numpy as np
 from rich import print as pprint
+from tqdm import tqdm
 
 ALL = ["all"]
 
@@ -37,6 +40,7 @@ class SoftGazFeatureCreator(object):
         self.normalize = normalize
 
         type_codes = {ner_type: type_ix for type_ix, ner_type in enumerate(ner_types)}
+
         if "LOC" in type_codes:
             type_codes["GPE"] = type_codes["LOC"]
 
@@ -54,9 +58,11 @@ class SoftGazFeatureCreator(object):
             for line in f:
                 # spl = [wiki_id, names/aliases, ner_type]
                 spl = line.strip().split(" ||| ")
+
                 if spl[2] != "null":
                     # spl[0] = wiki_id; spl[2] = ner_type
                     type_lookup[spl[0]] = type_codes[spl[2]]
+
         return type_lookup
 
     def load_candidates(self, candidate_file):
@@ -65,6 +71,7 @@ class SoftGazFeatureCreator(object):
             for line in f:
                 # spl = [span_string, wiki_id, ...]
                 spl = line.strip().split(" ||| ")
+
                 if len(spl) < 2:
                     continue
                 ngram_candidates[spl[0]] = spl[1]
@@ -73,12 +80,14 @@ class SoftGazFeatureCreator(object):
 
     def get_ngram_contexts(self, idx, sent, n):
         contexts = [0] * n
+
         for k in range(n):
             lower = idx + 1 - n + k
             upper = idx + 1 + k
             ngram_ctx_tokens = sent[lower:upper]
             ngram_ctx_string = " ".join(ngram_ctx_tokens)
             contexts[k] = ngram_ctx_string
+
         return contexts
 
     def create_features(self, conll_file):
@@ -91,6 +100,7 @@ class SoftGazFeatureCreator(object):
                 if line == "\n":
                     sents.append(cur_sent)
                     cur_sent = []
+
                     continue
                 spl = line.strip().split()
                 cur_sent.append(spl[0])
@@ -100,12 +110,14 @@ class SoftGazFeatureCreator(object):
 
         # Compute features for each sentence based on spans up to length 3
         already_printed_matches = set()
+
         for sent in tqdm(sents, desc="Constructing sentence features..."):
             sent_feats = []
+
             for i, word in enumerate(sent):
                 feats = []
-                for n in range(1, 4):
 
+                for n in range(1, 4):
                     # Feature vectors for span length n for the current word
                     top1_scores = np.zeros(shape=(2, self.num_types))
                     top3_counts = np.zeros(shape=(3, self.num_types))
@@ -117,9 +129,10 @@ class SoftGazFeatureCreator(object):
                     contexts = self.get_ngram_contexts(i, sent, n)
 
                     # Compute features for each context
-                    for j, context_g in enumerate(contexts):
 
+                    for j, context_g in enumerate(contexts):
                         # Convert context to IPA if the candidates are in IPA
+
                         if self.epi:
                             context = self.epi.transliterate(context_g)
                         else:
@@ -154,6 +167,7 @@ class SoftGazFeatureCreator(object):
 
                         if "top1" in self.feats:
                             top1 = cands[0]
+
                             if top1[0] in self.type_lookup:
                                 if j == len(contexts) - 1:
                                     top1_scores[0][self.type_lookup[top1[0]]] += float(
@@ -189,8 +203,10 @@ class SoftGazFeatureCreator(object):
                                 )
 
                     # Normalize vectors after adding scores from all spans of length n
+
                     if self.normalize:
                         top1_scores = top1_scores / len(contexts)
+
                         for k in range(3):
                             top3_counts[k] = top3_counts[k] / len(contexts)
                             top3_scores[k] = top3_scores[k] / len(contexts)
@@ -224,6 +240,7 @@ class SoftGazFeatureCreator(object):
             inputfile_feats.append(np.array(sent_feats))
 
         # Return sentence-wise list of features
+
         return inputfile_feats
 
 
