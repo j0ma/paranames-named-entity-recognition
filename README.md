@@ -7,6 +7,10 @@
 
 #### Prerequisites
 - At least `prepx` will be needed (link)
+- What data needs to be prepared?
+- What about the configs?
+
+#### Run the experiment
 
 The main workhorse is `full_experiment.sh` which you run with
 
