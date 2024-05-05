@@ -1,3 +1,8 @@
+
+### Related scripts
+- [`code/bilstm_crf_softgazetteers.py`](code/bilstm_crf_softgazetteers.py)
+- [`code/create_softgaz_features.py`](code/create_softgaz_features.py)
+
 ### What it does
 
 Main script for running the NER experiments. Mainly glues together other scripts and system tools.
