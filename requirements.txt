@@ -1,0 +1,12 @@
+git+https://github.com/j0ma/prepx.git
+cython
+seqscore
+rich
+tqdm
+click
+epitran
+numpy<=1.21.0
+pandas
+pudb
+jamo
+g2pk

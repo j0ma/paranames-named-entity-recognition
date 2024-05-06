@@ -175,16 +175,14 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 analysis
-code
-config
-conlleval_f1
-data
-full_experiment.sh
 full_ncrfpp_experiment.sh
 NCRFpp
 ner_model.jpg
 prepx
-README.md
-requirements.txt
-soft_gaz.jpg
 original-softgaz-repo
+
+experiments/
+data/en_kb
+
+paranames
+scratch/

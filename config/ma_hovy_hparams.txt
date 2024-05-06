@@ -1,0 +1,25 @@
+Taken from Table 1 in Ma & Hovy (2016):
+
+CNN
+    window size 3 # ✅
+    number of filters 30 # ✅
+    char emb dim 30 ✅
+
+LSTM
+    word emb dim 100 (rand init) ❌
+        - code has 128 for rand init
+    state size 200 ❌
+        - code has 256 as default
+    initial state 0.0 ✅
+
+Dropout
+    dropout rate 0.5 🤔
+        - code has 0.33 for CNN
+        - 0.5 for LSTM
+
+Common
+    batch size 10 ❌
+        - code has 16
+    initial learning rate 0.015 ✅
+    decay rate 0.05 ✅
+    gradient clipping 5.0 ✅
