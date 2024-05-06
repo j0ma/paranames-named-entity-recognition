@@ -179,5 +179,10 @@ full_ncrfpp_experiment.sh
 NCRFpp
 ner_model.jpg
 prepx
-requirements.txt
 original-softgaz-repo
+
+experiments/
+data/en_kb
+
+paranames
+scratch/

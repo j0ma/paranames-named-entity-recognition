@@ -6,9 +6,9 @@
 ### How to run things?
 
 #### Prerequisites
-- At least `prepx` will be needed (link)
 - What data needs to be prepared?
 - What about the configs?
+- Need to symlink paranames folder as `paranames`
 
 #### Run the experiment
 

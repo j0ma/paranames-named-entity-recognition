@@ -2,7 +2,7 @@
 
 # Complete experiment sequence for soft-gazetteers
 
-set -xeuo pipefail
+set -euo pipefail
 
 # Constants
 config_file=$1
@@ -27,6 +27,8 @@ check_these_vars=(
     "tr_num_epochs"
     "tr_use_softgaz_features"
 )
+
+source code/conda_stuff.sh
 
 # Step 0: Dependencies
 check_deps() {
