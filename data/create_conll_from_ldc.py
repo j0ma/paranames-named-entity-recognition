@@ -1,8 +1,11 @@
 """
 Convert the .tab format from LDC to conll format for the LORELEI dataset.
 
-Author: Shruti Rijhwani
-Contact: srijhwan@andrew.cmu.edu
+Authors:
+* Oriignal: Shruti Rijhwani
+* This version: Jonne Saleva
+
+Contact: jonnesaleva@brandeis.edu
 
 Please cite: 
 Soft Gazetteers for Low-Resource Named Entity Recognition (ACL 2020)
